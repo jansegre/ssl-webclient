@@ -19,6 +19,12 @@ $ = require("jquery")
 inner_width = 7500
 inner_height = 5500
 
+options =
+  show_frame_skip: false
+  show_trail: false
+
+global.options = options
+
 svg = do ->
   _svg = d3.select("#field").append("svg")
     .attr("viewBox", "-#{inner_width / 2} -#{inner_height / 2} #{inner_width} #{inner_height}")
@@ -179,7 +185,7 @@ drawField = (field_geometry, is_blue_left=true) ->
 
   # spacing between lines
   r = 100
-  s = field_geometry.boundary_width / r
+  s = 1 + field_geometry.boundary_width / r
   fw = s + field_geometry.field_width / r / 2 | 0
   fl = s + field_geometry.field_length / r / 2 | 0
   grid = svg.select(".grid")
@@ -269,8 +275,7 @@ drawField = (field_geometry, is_blue_left=true) ->
     .attr("x", (f) -> sp)
     .attr("y", (f) -> -f.field_width / 2 + sp + vPxPerLetter)
 
-# in miliseconds
-max_screen_time = 100
+max_frame_distance = 2
 
 # robot hover tooltip
 numFormat = "0"
@@ -288,10 +293,8 @@ persistTip = (text) ->
   persistentText = text
   $(".tip").html(text) unless tipBusy
 
-drawRobots = (robots, color, timestamp) ->
-  timestampify(robots, timestamp)
-
-  robot = svg.selectAll(".robot.#{color}").data(robots, (d) -> d.robot_id)
+drawRobots = (robots, color, timestamp, camera_id, frame_number) ->
+  robot = svg.selectAll(".active.robot.#{color}").data(robots, (d) -> d.robot_id)
   robot.select("path")
     .attr("d", robot_path)
     .attr("transform", robot_transform)
@@ -300,9 +303,16 @@ drawRobots = (robots, color, timestamp) ->
     .attr("x", (r) -> r.x)
     .attr("y", (r) -> -r.y)
 
+  if options.show_trail
+    robot
+      .classed("active", false)
+      .classed("inactive", true)
+
   g = robot.enter()
     .append("g")
     .classed("robot", true)
+    .classed("active", not options.show_trail)
+    .classed("inactive", options.show_trail)
     .classed(color, true)
     .on("mouseover", (d) -> showTip("#{color} #{d.robot_id} (#{numeral(d.x).format(numFormat)},#{numeral(d.y).format(numFormat)})"))
     .on("mouseout", -> restTip())
@@ -314,39 +324,55 @@ drawRobots = (robots, color, timestamp) ->
     .attr("x", (r) -> r.x)
     .attr("y", (r) -> -r.y)
 
-  robot.exit()
+  robot_exit = robot.exit()
     .filter (d) ->
       # delete if either it doesn't have a timestamp, its screen time has expired
-      # or its timestamp is at the future
-      not d.timestamp? or timestamp - d.timestamp > max_screen_time or d.timestamp > timestamp
-    .remove()
+      # or its timestamp is at the future, but not if it's a different camera
+      Math.abs(frame_number - d.frame_number) > max_frame_distance and d.camera_id is camera_id
+
+  if options.show_frame_skip
+    robot_exit.classed("active", false)
+    robot_exit.classed("inactive", true)
+  else
+    robot_exit.remove()
 
 
-drawBalls = (balls, timestamp) ->
-  timestampify(balls, timestamp)
+drawBalls = (balls, timestamp, camera_id, frame_number) ->
 
-  ball = svg.selectAll(".ball")
+  ball = svg.selectAll(".ball.active")
     .data(balls)
 
   ball
     .attr("cx", (b) -> b.x)
     .attr("cy", (b) -> -b.y)
 
+  if options.show_trail
+    ball
+      .classed("active", false)
+      .classed("inactive", true)
+
   ball.enter()
     .append("circle")
     .classed("ball", true)
+    .classed("active", not options.show_trail)
+    .classed("inactive", options.show_trail)
     .attr("r", ball_radius)
     .attr("cx", (b) -> b.x)
     .attr("cy", (b) -> -b.y)
     .on("mouseover", (d) -> showTip("ball (#{numeral(d.x).format(numFormat)},#{numeral(d.y).format(numFormat)})"))
     .on("mouseout", -> restTip())
 
-  ball.exit()
+  ball_exit = ball.exit()
     .filter (d) ->
       # delete if either it doesn't have a timestamp, its screen time has expired
-      # or its timestamp is at the future
-      not d.timestamp? or timestamp - d.timestamp > max_screen_time or d.timestamp > timestamp
-    .remove()
+      # or its timestamp is at the future, but not if it's a different camera
+      #(not d.timestamp? or timestamp - d.timestamp > max_screen_time or d.timestamp > timestamp) and d.camera_id isnt camera_id
+      Math.abs(frame_number - d.frame_number) > max_frame_distance and d.camera_id is camera_id
+  if options.show_frame_skip
+    ball_exit.classed("active", false)
+    ball_exit.classed("inactive", true)
+  else
+    ball_exit.remove()
 
 hPxPerLetter = 156
 vPxPerLetter = 250
@@ -358,7 +384,7 @@ drawReferee = (referee, is_blue_left) ->
     .text(ticks_to_time)
     .attr("textLength", (d) -> ticks_to_time(d).length * hPxPerLetterSm)
 
-  [left, right] = if is_blue_left then [referee.blue, referee.yellow] else [referee.yellow, referee.blue]
+  [right, left] = if is_blue_left then [referee.blue, referee.yellow] else [referee.yellow, referee.blue]
 
   svg.select(".left-name").datum(left)
     .text((d) -> d.name)
@@ -525,10 +551,22 @@ class Painter
       drawReferee @referee, @is_blue_left
     if @drawDetection
       @drawDetection = false
-      drawRobots @detection.robots_yellow, "yellow", @timestamp
-      drawRobots @detection.robots_blue, "blue", @timestamp
-      drawBalls  @detection.balls, @timestamp
-    requestAnimationFrame => @_draw()
+      for robot in @detection.robots_yellow
+        robot.timestamp = @detection.t_capture
+        robot.camera_id = @detection.camera_id
+        robot.frame_number = @detection.frame_number
+      for robot in @detection.robots_blue
+        robot.timestamp = @detection.t_capture
+        robot.camera_id = @detection.camera_id
+        robot.frame_number = @detection.frame_number
+      for ball in @detection.balls
+        ball.timestamp = @detection.t_capture
+        ball.camera_id = @detection.camera_id
+        ball.frame_number = @detection.frame_number
+      drawRobots @detection.robots_yellow, "yellow", @detection.t_capture, @detection.camera_id, @detection.frame_number
+      drawRobots @detection.robots_blue, "blue", @detection.t_capture, @detection.camera_id, @detection.frame_number
+      drawBalls  @detection.balls, @detection.t_capture, @detection.camera_id, @detection.frame_number
+    #requestAnimationFrame => @_draw()
 
   updateVision: (packet, @timestamp=new Date()) ->
 
@@ -539,6 +577,8 @@ class Painter
     if packet.geometry
       @geometry = packet.geometry
       @drawField = true
+
+    @_draw()
 
   updateReferee: (@referee, @timestamp=new Date()) ->
     @drawReferee = true
